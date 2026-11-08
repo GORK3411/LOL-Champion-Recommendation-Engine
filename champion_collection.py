@@ -109,14 +109,26 @@ def main(pages = 1, top = 5):
     puuids = list(dict.fromkeys(puuids))
     print(f"{len(puuids)} players found")
 
+    # players already saved in the csv: we don't fetch their champions again
+    existing = set()
+    if os.path.exists(OUTPUT_PATH):
+        with open(OUTPUT_PATH, newline="", encoding="utf-8") as f:
+            existing = {row["puuid"] for row in csv.DictReader(f)}
+    print(f"{len(existing)} players already in {OUTPUT_PATH}")
+
     os.makedirs(os.path.dirname(OUTPUT_PATH), exist_ok=True)
-    with open(OUTPUT_PATH, "w", newline="", encoding="utf-8") as f:
+    write_header = not os.path.exists(OUTPUT_PATH) or os.path.getsize(OUTPUT_PATH) == 0
+    # "a" = append to the existing csv instead of overwriting it
+    with open(OUTPUT_PATH, "a", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         # champions are separated by "|" because some names contain spaces (e.g. "Lee Sin")
-        writer.writerow(["puuid", "champions"])
+        if write_header:
+            writer.writerow(["puuid", "champions"])
 
         saved = 0
         for i, puuid in enumerate(puuids, 1):
+            if puuid in existing:
+                continue  # already in the csv, skip the API call
             # 2. top champions of the player
             try:
                 champion_ids = get_top_champions(puuid, top)
@@ -140,4 +152,4 @@ def main(pages = 1, top = 5):
 
 
 if __name__ == "__main__":
-    main()
+    main(10)
