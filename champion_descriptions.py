@@ -1,16 +1,24 @@
-import os
-import re
+"""Download champion ability text and prepare two forms for NLP."""
+
+import argparse
 import csv
+from functools import cache
 import html
-import requests
+from pathlib import Path
+import re
+from shutil import copyfile
+from tempfile import TemporaryDirectory
+
 import pandas as pd
-import spacy
+import requests
 
-DDRAGON = "https://ddragon.leagueoflegends.com"
-CHAMPIONS_PATH = os.path.join("data", "champions_id.csv")
-OUTPUT_PATH = os.path.join("data", "champion_descriptions.csv")
+from data_io import (
+    ABILITIES, CLEAN_FIELDS, DATA_DIR, DDRAGON, RAW_FIELDS,
+    get_json, read_champion_ids, read_rows, write_rows,
+)
 
-ABILITIES = ["P", "Q", "W", "E", "R"]
+CHAMPIONS_PATH = DATA_DIR / "champions_id.csv"
+OUTPUT_PATH = DATA_DIR / "champion_descriptions.csv"
 
 # ---------------------------------------------------------------------------
 # Editable preprocessing dictionaries
@@ -65,9 +73,11 @@ SYNONYMS = {
 # we don't replace them alone (e.g. "Twisted" from "Twisted Fate")
 NAME_PARTS_EXCLUDE = {"twisted", "master", "miss", "dr", "iv"}
 
-# spaCy model loaded once for the whole module (parser and NER aren't needed for lemmas)
-nlp = spacy.load("en_core_web_sm", disable=["parser", "ner"])
-STOPWORDS = nlp.Defaults.stop_words | CUSTOM_STOPWORDS
+@cache
+def get_nlp():
+    import spacy
+
+    return spacy.load("en_core_web_sm", disable=["parser", "ner"])
 
 
 # ---------------------------------------------------------------------------
@@ -81,7 +91,7 @@ placeholders ({{ e1 }}, @Effect1Amount@). Tags become a space so words don't sti
 def remove_markup(text):
     text = html.unescape(text)                  # &nbsp; &amp; ... -> normal characters
     text = re.sub(r"<[^>]+>", " ", text)        # HTML / markup tags
-    text = re.sub(r"\{\{.*?\}\}", " ", text)    # {{ e1 }}
+    text = re.sub(r"\{\{.*?\}\}", " ", text, flags=re.DOTALL)    # {{ e1 }}
     text = re.sub(r"@[\w.*:]+@", " ", text)     # @Effect1Amount@
     return text
 
@@ -158,10 +168,12 @@ steps 7 + 8: tokenize and lemmatize with spaCy, keep only alphabetic tokens,
 remove standard + custom stopwords
 """
 def lemmatize(text):
+    nlp = get_nlp()
+    stopwords = nlp.Defaults.stop_words | CUSTOM_STOPWORDS
     lemmas = []
     for tok in nlp(text):
         lemma = tok.lemma_.lower()
-        if tok.is_alpha and lemma not in STOPWORDS and tok.lower_ not in STOPWORDS:
+        if tok.is_alpha and lemma not in stopwords and tok.lower_ not in stopwords:
             lemmas.append(lemma)
     return lemmas
 
@@ -185,109 +197,114 @@ def full_preprocess(clean_text):
     return " ".join(apply_synonyms(lemmas))   # step 9
 
 
-"""
-read the raw descriptions csv (champion,P,Q,W,E,R), preprocess every ability and
-save the result to champions_clean.csv in the same folder.
-output columns: champion, X_text, X_tokens for X in P,Q,W,E,R, kit_text, kit_tokens.
-return the resulting DataFrame
-"""
-def clean(path):
-    raw = pd.read_csv(path)
-    name_col = raw.columns[0]   # "champion" (first column)
-
+def preprocess_rows(raw_rows):
+    """Produce natural text, normalized tokens, and joined kits."""
     rows = []
-    for _, row in raw.iterrows():
-        champion = row[name_col]
-        out = {name_col: champion}
-        for x in ABILITIES:
-            out[f"{x}_text"] = light_clean(row[x], champion)
-            out[f"{x}_tokens"] = full_preprocess(out[f"{x}_text"])
-        # whole kit = the 5 abilities joined (empty abilities skipped)
-        out["kit_text"] = " ".join(out[f"{x}_text"] for x in ABILITIES if out[f"{x}_text"])
-        out["kit_tokens"] = " ".join(out[f"{x}_tokens"] for x in ABILITIES if out[f"{x}_tokens"])
+    seen = set()
+    for row in raw_rows:
+        champion = row["champion"]
+        if not champion.strip() or champion != champion.strip() or champion in seen:
+            raise ValueError("Description rows require distinct, nonempty champion names.")
+        seen.add(champion)
+        out = {"champion": champion}
+        for slot in ABILITIES:
+            out[f"{slot}_text"] = light_clean(row[slot], champion)
+            if not out[f"{slot}_text"]:
+                raise ValueError(f"{champion} {slot} has no text after cleaning.")
+            out[f"{slot}_tokens"] = full_preprocess(out[f"{slot}_text"])
+        for kind in ("text", "tokens"):
+            out[f"kit_{kind}"] = " ".join(
+                out[f"{slot}_{kind}"] for slot in ABILITIES if out[f"{slot}_{kind}"]
+            )
         rows.append(out)
+    if not rows:
+        raise ValueError("No champion descriptions to clean.")
+    return rows
 
-    df = pd.DataFrame(rows)
-    out_path = os.path.join(os.path.dirname(path), "champions_clean.csv")
-    df.to_csv(out_path, index=False, encoding="utf-8")
-    print(f"cleaned {len(df)} champions, saved to {out_path}")
-    return df
 
-"""
-read the champions display names from data/champions_id.csv (created by champion_collection.py)
-"""
+def clean(path):
+    """Regenerate champions_clean.csv next to the raw CSV."""
+    rows = preprocess_rows(read_rows(path, RAW_FIELDS))
+    output = Path(path).with_name("champions_clean.csv")
+    write_rows(output, CLEAN_FIELDS, rows)
+    print(f"Cleaned {len(rows)} champions into {output}")
+    return pd.DataFrame(rows)
+
+
 def get_champion_names():
-    with open(CHAMPIONS_PATH, newline="", encoding="utf-8") as f:
-        return [row["name"] for row in csv.DictReader(f)]
+    return list(read_champion_ids(CHAMPIONS_PATH).values())
 
 
-"""
-Data Dragon uses internal ids in its urls, which can differ from the display names
-(e.g. "Wukong" -> "MonkeyKing", "Lee Sin" -> "LeeSin").
-return a dictionary {display name: internal id}
-"""
 def get_name_to_ddragon_id(patch):
-    data = requests.get(f"{DDRAGON}/cdn/{patch}/data/en_US/champion.json").json()["data"]
-    return {c["name"]: c["id"] for c in data.values()}
+    catalog = get_json(f"{DDRAGON}/cdn/{patch}/data/en_US/champion.json")["data"]
+    return {champion["name"]: champion["id"] for champion in catalog.values()}
 
 
-"""
-extract the passive and the 4 spells descriptions from a champion json.
-return a list [P, Q, W, E, R]
-"""
 def extract_abilities(champ_json, ddragon_id):
-    champ = champ_json["data"][ddragon_id]
-    passive = champ["passive"]["description"]
-    # "spells" is always ordered Q, W, E, R
-    spells = [spell["description"] for spell in champ["spells"]]
-    return [passive] + spells
+    champion = champ_json["data"][ddragon_id]
+    passive = champion["passive"]["description"]
+    return [passive] + [spell["description"] for spell in champion["spells"]]
 
 
-def main():
-    # get all champions names from data/champions_id.csv
+def publish_descriptions(raw, cleaned):
+    """Stage both CSVs and restore the previous raw file if publishing clean fails."""
+    raw_path = Path(OUTPUT_PATH)
+    clean_path = raw_path.with_name("champions_clean.csv")
+    raw_path.parent.mkdir(parents=True, exist_ok=True)
+    with TemporaryDirectory(dir=raw_path.parent) as folder:
+        staged_raw = Path(folder) / raw_path.name
+        staged_clean = Path(folder) / clean_path.name
+        backup = Path(folder) / "previous-raw.csv"
+        write_rows(staged_raw, RAW_FIELDS, raw)
+        write_rows(staged_clean, CLEAN_FIELDS, cleaned)
+        if raw_path.exists():
+            copyfile(raw_path, backup)
+        staged_raw.replace(raw_path)
+        try:
+            staged_clean.replace(clean_path)
+        except OSError:
+            if backup.exists():
+                backup.replace(raw_path)
+            else:
+                raw_path.unlink()
+            raise
+
+
+def main(patch=None):
     champions = get_champion_names()
+    patch = patch or get_json(f"{DDRAGON}/api/versions.json")[0]
+    name_to_id = get_name_to_ddragon_id(patch)
+    missing = set(champions) - name_to_id.keys()
+    if missing:
+        raise ValueError(f"Patch {patch} is missing: {', '.join(sorted(missing))}")
 
-    latest_patch = requests.get(f"{DDRAGON}/api/versions.json").json()[0]
-    name_to_id = get_name_to_ddragon_id(latest_patch)
-    print(f"patch {latest_patch}: {len(champions)} champions")
+    print(f"Downloading {len(champions)} champions for patch {patch}")
+    rows = []
+    for champion in champions:
+        champion_id = name_to_id[champion]
+        url = f"{DDRAGON}/cdn/{patch}/data/en_US/champion/{champion_id}.json"
+        abilities = extract_abilities(get_json(url), champion_id)
+        if len(abilities) != len(ABILITIES) or not all(
+            isinstance(text, str) and text.strip() for text in abilities
+        ):
+            raise ValueError(f"{champion} does not have five populated ability descriptions.")
+        rows.append({"champion": champion, **dict(zip(ABILITIES, abilities))})
 
-    # create a new csv with the columns : champion,P,Q,W,E,R
-    os.makedirs(os.path.dirname(OUTPUT_PATH), exist_ok=True)
-    with open(OUTPUT_PATH, "w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow(["champion", "P", "Q", "W", "E", "R"])
-
-        for i, champ in enumerate(champions, 1):
-            ddragon_id = name_to_id.get(champ)
-            if ddragon_id is None:
-                print(f"skipping {champ}: not found in Data Dragon")
-                continue
-
-            # download champion json
-            url = f"{DDRAGON}/cdn/{latest_patch}/data/en_US/champion/{ddragon_id}.json"
-            try:
-                r = requests.get(url)
-                r.raise_for_status()
-                champ_json = r.json()
-            except requests.RequestException as e:
-                print(f"skipping {champ}: {e}")
-                continue
-
-            # extract the abilities and passive description
-            abilities = extract_abilities(champ_json, ddragon_id)
-
-            # append the csv with the current data
-            # the display name is kept so the ids match player_pools.csv
-            writer.writerow([champ] + abilities)
-
-            if i % 20 == 0:
-                print(f"{i}/{len(champions)} champions done")
-
-    print(f"done: saved to {OUTPUT_PATH}")
-
-    # preprocess the raw descriptions -> data/champions_clean.csv
-    clean(OUTPUT_PATH)
+    # Finish all downloads and NLP before touching either existing file.
+    cleaned = preprocess_rows(rows)
+    publish_descriptions(rows, cleaned)
+    print(f"Saved raw and cleaned descriptions for patch {patch}")
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--patch", help="Data Dragon version to download")
+    parser.add_argument("--clean-only", action="store_true", help="Reuse the saved raw CSV")
+    args = parser.parse_args()
+    try:
+        if args.clean_only:
+            clean(OUTPUT_PATH)
+        else:
+            main(args.patch)
+    except (ValueError, OSError, KeyError, csv.Error, requests.RequestException) as error:
+        parser.exit(1, f"Description refresh stopped: {error}\n")

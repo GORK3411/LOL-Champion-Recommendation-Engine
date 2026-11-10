@@ -1,0 +1,7 @@
+gensim==4.4.0
+numpy==2.5.4
+pandas==2.3.3
+requests==2.34.2
+scikit-learn==1.9.1
+scipy==1.18.1
+spacy==3.8.18
